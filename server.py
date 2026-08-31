@@ -316,6 +316,12 @@ def _build_response(check_result: dict, site_url: str, cc_str: str, elapsed: flo
         charged = "True"
         approved = "True"
         _stats["charged"] += 1
+    elif status == "APPROVED":
+        # 3DS BYPASS: Card was approved via 3DS bypass
+        response_label = "CARD_APPROVED"
+        charged = "False"
+        approved = "True"
+        _stats["approved"] += 1
     elif status == "3DS":
         response_label = "CARD_APPROVED"
         charged = "False"
@@ -336,6 +342,16 @@ def _build_response(check_result: dict, site_url: str, cc_str: str, elapsed: flo
         charged = "False"
         approved = "False"
         _stats["errors"] += 1
+    elif status == "ERROR":
+        # Check if it's a session expired error
+        if "no longer active" in (response_text or "").lower() or "expired" in (response_text or "").lower():
+            response_label = "CARD_DECLINED"
+            response_text = "Checkout Session Expired"
+        else:
+            response_label = "CARD_DECLINED"
+        charged = "False"
+        approved = "False"
+        _stats["errors"] += 1
     else:
         response_label = "CARD_DECLINED"
         charged = "False"
@@ -352,6 +368,9 @@ def _build_response(check_result: dict, site_url: str, cc_str: str, elapsed: flo
     if status in ("ERROR", "NOT SUPPORTED"):
         retryable = "True"
 
+    # status_code shows the EXACT response text (e.g. "3DS Bypassed (Approved)" or "Declined after 3DS bypassed — [reason]")
+    status_code_display = response_text if response_text else status
+
     return {
         "Response":   response_label,
         "CC":          cc_str,
@@ -362,8 +381,8 @@ def _build_response(check_result: dict, site_url: str, cc_str: str, elapsed: flo
         "Time":         f"{elapsed:.2f}s",
         "Retryable":    retryable,
         "siteurl":      site_url,
-        "status_code":  status,
-        "error":        response_text if status not in ("CHARGED", "3DS") else None,
+        "status_code":  status_code_display,
+        "error":        None if status in ("CHARGED", "APPROVED", "3DS") else response_text,
     }
 
 
@@ -713,4 +732,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=False,
         timeout_keep_alive=30,
-    )
+        )
