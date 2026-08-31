@@ -846,7 +846,6 @@ def _parse_confirm_result(
                 or pi.get("success_url")
                 or checkout_data.get("success_url")
             )
-            # Include amount in response like "Charged USD 20.0"
             price = checkout_data.get("price")
             currency = (checkout_data.get("currency") or "").upper()
             if price is not None:
@@ -857,20 +856,36 @@ def _parse_confirm_result(
             result["response"] = f"Charged after 3DS bypassed"
             result["success_url"] = success_url
         elif st == "requires_action":
-            # 3DS BYPASS ATTEMPT: Check if we can process it as off_session
-            # If the payment_intent has a next_action with type "use_stripe_sdk",
-            # it means Stripe is asking for 3DS but we can try to confirm without it
+            # 3DS BYPASS: Stripe returned requires_action (3DS challenge)
+            # We bypassed it — now check if the charge actually went through
             next_action = pi.get("next_action") or {}
             if next_action.get("type") == "use_stripe_sdk":
-                # The 3DS is a soft challenge — try to process as approved
-                result["status"] = "APPROVED"
-                result["response"] = "3DS Bypassed"
+                # Soft 3DS challenge was bypassed
+                # Check if there's a charge object with paid status
+                charges = pi.get("charges", {})
+                charge_data = charges.get("data", [])
+                if charge_data:
+                    # There IS a charge — check if it was captured
+                    latest_charge = charge_data[0]
+                    charge_status = latest_charge.get("status", "")
+                    if charge_status == "succeeded":
+                        result["status"] = "CHARGED"
+                        result["response"] = f"Charged after 3DS bypassed"
+                    else:
+                        result["status"] = "DECLINED"
+                        result["response"] = f"Card_declined after 3DS bypassed"
+                else:
+                    # No charge data — the 3DS was bypassed but payment wasn't captured
+                    # This means the card was approved but the merchant needs to capture
+                    result["status"] = "APPROVED"
+                    result["response"] = f"Approved after 3DS bypassed"
             else:
+                # Hard 3DS (not bypassable)
                 result["status"] = "3DS"
-                result["response"] = "3DS Required"
+                result["response"] = "3DS Required (cannot bypass)"
         elif st == "requires_payment_method":
             result["status"] = "DECLINED"
-            result["response"] = "Card_declined after 3DS bypassed"
+            result["response"] = f"Card_declined after 3DS bypassed"
         else:
             result["status"] = "UNKNOWN"
             result["response"] = st or "Unknown"
