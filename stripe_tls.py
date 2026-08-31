@@ -828,11 +828,11 @@ def _parse_confirm_result(
         else:
             # Format: [decline_code] [message] for detailed response
             if dc:
-                resp = f"[{dc}] [{raw}]"
+                resp = f"Card_declined after 3DS bypassed — [{dc}] [{raw}]"
             else:
-                resp = _clean_response(raw)
+                resp = f"Card_declined after 3DS bypassed — {_clean_response(raw)}"
             result["status"] = "DECLINED"
-            result["response"] = f"Declined after 3DS bypassed — {resp}"
+            result["response"] = resp
             result["decline_code"] = dc
     else:
         # Check for payment_intent, setup_intent, or direct status
@@ -854,7 +854,7 @@ def _parse_confirm_result(
             else:
                 charged_msg = "Payment Successful"
             result["status"] = "CHARGED"
-            result["response"] = f"Charged after 3DS bypassed — {charged_msg}"
+            result["response"] = f"Charged after 3DS bypassed"
             result["success_url"] = success_url
         elif st == "requires_action":
             # 3DS BYPASS ATTEMPT: Check if we can process it as off_session
@@ -864,13 +864,13 @@ def _parse_confirm_result(
             if next_action.get("type") == "use_stripe_sdk":
                 # The 3DS is a soft challenge — try to process as approved
                 result["status"] = "APPROVED"
-                result["response"] = "3DS Bypassed (Approved)"
+                result["response"] = "3DS Bypassed"
             else:
                 result["status"] = "3DS"
                 result["response"] = "3DS Required"
         elif st == "requires_payment_method":
             result["status"] = "DECLINED"
-            result["response"] = "Declined after 3DS bypassed — Card Declined"
+            result["response"] = "Card_declined after 3DS bypassed"
         else:
             result["status"] = "UNKNOWN"
             result["response"] = st or "Unknown"
