@@ -853,7 +853,7 @@ def _parse_confirm_result(
             else:
                 charged_msg = "Payment Successful"
             result["status"] = "CHARGED"
-            result["response"] = f"Charged after 3DS bypassed"
+            result["response"] = f"{charged_msg} after 3DS bypassed"
             result["success_url"] = success_url
         elif st == "requires_action":
             # 3DS BYPASS: Stripe returned requires_action (3DS challenge)
@@ -868,12 +868,30 @@ def _parse_confirm_result(
                     # There IS a charge — check if it was captured
                     latest_charge = charge_data[0]
                     charge_status = latest_charge.get("status", "")
+                    # Get the actual decline code/message if available
+                    failure_code = latest_charge.get("failure_code", "")
+                    failure_message = latest_charge.get("failure_message", "")
+                    
                     if charge_status == "succeeded":
+                        price = checkout_data.get("price")
+                        currency = (checkout_data.get("currency") or "").upper()
+                        if price is not None:
+                            charged_msg = f"Charged {currency} {price}"
+                        else:
+                            charged_msg = "Payment Successful"
                         result["status"] = "CHARGED"
-                        result["response"] = f"Charged after 3DS bypassed"
+                        result["response"] = f"{charged_msg} after 3DS bypassed"
                     else:
-                        result["status"] = "DECLINED"
-                        result["response"] = f"Card_declined after 3DS bypassed"
+                        # Use the actual Stripe failure message
+                        if failure_code and failure_message:
+                            result["status"] = "DECLINED"
+                            result["response"] = f"Card_declined [{failure_code}] [{failure_message}] after 3DS bypassed"
+                        elif failure_code:
+                            result["status"] = "DECLINED"
+                            result["response"] = f"Card_declined [{failure_code}] after 3DS bypassed"
+                        else:
+                            result["status"] = "DECLINED"
+                            result["response"] = f"Card_declined [{charge_status}] after 3DS bypassed"
                 else:
                     # No charge data — the 3DS was bypassed but payment wasn't captured
                     # This means the card was approved but the merchant needs to capture
