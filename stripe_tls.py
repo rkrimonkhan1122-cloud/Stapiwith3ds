@@ -894,9 +894,10 @@ def _parse_confirm_result(
                             result["response"] = f"Card_declined [{charge_status}] after 3DS bypassed"
                 else:
                     # No charge data — the 3DS was bypassed but payment wasn't captured
-                    # This means the card was approved but the merchant needs to capture
+                    # Show the EXACT Stripe response (requires_action) + next_action details
+                    na_type = next_action.get("type", "unknown")
                     result["status"] = "APPROVED"
-                    result["response"] = f"Approved after 3DS bypassed"
+                    result["response"] = f"{st} ({na_type}) after 3DS bypassed"
             else:
                 # Hard 3DS (not bypassable)
                 result["status"] = "3DS"
